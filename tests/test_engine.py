@@ -1,0 +1,241 @@
+import contextlib, io, itertools, networkx as nx, pytest
+from learned_selection.engine import (run_code_faithful, run_code_bounded, run_beam, code_prune, gls_generator,
+                                      vendored_gls_generator, pasqal_greedy_piece_solver, exact_piece_solver,
+                                      best_of_restarts)
+from learned_selection.instances import erdos_renyi
+from learned_selection.lattice import load_coords
+from learned_selection.solvers import exact_mis, is_independent, min_degree_greedy
+from learned_selection.vendored import greedy_subgraph_solver_vv, weighted_generate_different_mis
+
+CASES = list(itertools.product([20, 30, 40], [0.25, 0.5], [0, 1, 2], [(4, 2, 10), (2, 2, 5), (3, 1, 10)]))
+# On the small cases above, big pieces only appear in round 1, so pruning never acts. These larger ones
+# were chosen because pruning to l, always pruning to k, or never resetting the counter each changes the result.
+PRUNING_CASES = [(120, 0.2, 2, (4, 2, 10)), (150, 0.1, 1, (2, 2, 5)), (150, 0.1, 2, (3, 1, 10)),
+                 (150, 0.15, 0, (4, 2, 10)), (150, 0.1, 3, (2, 2, 5)), (150, 0.15, 3, (4, 2, 10))]
+CASES += PRUNING_CASES
+
+@pytest.mark.parametrize("n,p,seed,ksl", CASES)
+def test_matches_vendored_breadthfirst_exactly(n, p, seed, ksl):
+    k, s, l = ksl
+    G = erdos_renyi(n, p, seed)
+    with contextlib.redirect_stdout(io.StringIO()):
+        best, _, nodes = greedy_subgraph_solver_vv(G, load_coords(), 6.6, weighted_generate_different_mis).solve(
+            "breadthfirst", exact_solving_threshold=5, subgraph_quantity=k,
+            mis_sample_quantity=s, exploration_threshold=l)
+    # Pasqal's piece solver draws from the global RNG, which only the vendored generator reseeds
+    r = run_beam(G, vendored_gls_generator(), pasqal_greedy_piece_solver(), k, s, code_prune(k, l))
+    assert r.solution == frozenset(best) and r.pasqal_runs == len(nodes)
+
+@pytest.mark.parametrize("n,p,seed,ksl", CASES[:54:7] + PRUNING_CASES)
+def test_port_reproduces_vendored_runs(n, p, seed, ksl):
+    k, s, l = ksl
+    G = erdos_renyi(n, p, seed)
+    a = run_code_faithful(G, k, s, l)
+    b = run_beam(G, vendored_gls_generator(), exact_piece_solver, k, s, code_prune(k, l))
+    assert (a.solution, a.quantum_runs, a.pasqal_runs, a.atoms) == (b.solution, b.quantum_runs, b.pasqal_runs, b.atoms)
+
+def test_counts_small_pieces():
+    r = run_code_faithful(erdos_renyi(40, 0.75, 0), 4, 2, 10)
+    assert r.quantum_runs > r.pasqal_runs and r.rounds >= 1
+
+def test_own_rng_survives_vendored_reseeding():
+    import random
+    from learned_selection.engine import paper_generator
+    G = erdos_renyi(50, 0.2, 2)
+    random.seed(123); before, maps = min_degree_greedy(G, 7), paper_generator(seed=4)(G, 4)
+    vendored_gls_generator()(G, 4); random.seed(999)
+    assert min_degree_greedy(G, 7) == before and paper_generator(seed=4)(G, 4) == maps
+
+def test_code_prune_running_counter():
+    p = code_prune(2, 10)
+    lv = [(None, [0] * i) for i in range(6)]
+    assert p(lv, 6) == lv                                   # counter 6: no prune
+    assert [len(b[1]) for b in p(lv, 6)] == [5, 4]         # counter 12 > 10: keep k=2 best, reset
+    assert p(lv, 6) == lv                                   # counter back to 6
+
+def test_only_solver_children_count_toward_pruning():
+    seen, returned = [], []
+    inner = code_prune(4, 10)
+    spy_prune = lambda level, children: (seen.append(children), inner(level, children))[1]
+    def spy_solve(piece, m, s):
+        out = exact_piece_solver(piece, m, s)
+        returned.append(len(out))
+        return out
+    r = run_beam(erdos_renyi(40, 0.75, 0), gls_generator(), spy_solve, 4, 2, spy_prune)
+    assert r.quantum_runs > r.pasqal_runs          # small pieces did occur
+    assert sum(seen) == sum(returned)              # yet only solver children were counted
+
+def test_generators_require_trap_ids_in_order():
+    c = load_coords()
+    shuffled = {t: c[t] for t in reversed(list(c))}
+    with pytest.raises(ValueError):
+        gls_generator(coords=shuffled)
+
+def test_engine_on_string_labels():
+    G = erdos_renyi(30, 0.25, 0)
+    S = nx.relabel_nodes(G, lambda i: f"S{i:02d}")   # zero-padded: repr order equals int order
+    r_int, r_str = run_code_faithful(G, 4, 2, 10), run_code_faithful(S, 4, 2, 10)
+    assert is_independent(S, r_str.solution)
+    assert r_str.solution == frozenset(f"S{i:02d}" for i in r_int.solution)
+
+@pytest.mark.parametrize("G", [nx.empty_graph(0), nx.empty_graph(7), nx.path_graph(4),
+                               nx.disjoint_union_all([nx.path_graph(3), nx.path_graph(4), nx.empty_graph(3)])])
+def test_engine_degenerate_graphs(G):
+    nx.set_node_attributes(G, 1, "weight")
+    r = run_code_faithful(G, 4, 2, 10)
+    assert r.size == len(exact_mis(G)[0]) and is_independent(G, r.solution)
+
+def test_engine_refuses_beam_explosion():
+    G = nx.empty_graph(40)
+    nx.set_node_attributes(G, 1, "weight")
+    with pytest.raises(RuntimeError, match="beam exploded"):
+        run_beam(G, gls_generator(), exact_piece_solver, 4, 2, code_prune(4, 10), max_branches=50)
+
+def test_engine_accepts_short_solver_output():
+    seen, inner = [], code_prune(4, 10)
+    def prune(level, children):
+        seen.append(children)
+        return inner(level, children)
+    G = erdos_renyi(40, 0.25, 1)
+    r = run_beam(G, gls_generator(), lambda piece, m, s: exact_piece_solver(piece, m, 1), 4, 3, prune)
+    assert is_independent(G, r.solution) and sum(seen) == r.pasqal_runs   # one child per solver call
+
+def test_count_small_prunes_on_small_children():
+    level = [(None, [0] * i) for i in range(5)]
+    assert [len(b[1]) for b in code_prune(2, 3, count_small=True)(level, 0)] == [4, 3]
+    assert code_prune(2, 3)(level, 0) == level
+
+def test_bounded_loop_survives_isolated_vertices():
+    G = nx.empty_graph(40)
+    nx.set_node_attributes(G, 1, "weight")
+    with pytest.raises(RuntimeError, match="beam exploded"):
+        run_code_faithful(G, 4, 2, 10, max_branches=50)
+    assert run_code_bounded(G, 4, 2, 10, max_branches=50).size == 40
+
+def test_run_sizes_account_for_every_run():
+    G = erdos_renyi(60, 0.25, 0)
+    r = run_code_bounded(G, 4, 2, 10)
+    assert len(r.run_sizes) == r.quantum_runs and sum(x > 5 for x in r.run_sizes) == r.pasqal_runs
+    assert sum(x for x in r.run_sizes if x > 5) == r.atoms
+    b = best_of_restarts(lambda i: run_code_bounded(G, 4, 2, 10, seed=i), 2)
+    assert len(b.run_sizes) == b.quantum_runs
+
+GAP_CASES = list(itertools.product([30, 40], range(6), ["drop0", "drop3711", "shift100"]))
+
+def _gap_variant(G, variant):
+    if variant == "drop0":
+        G.remove_node(0)
+    elif variant == "drop3711":
+        G.remove_nodes_from([3, 7, 11])
+    else:
+        G = nx.relabel_nodes(G, lambda v: v + 100)
+    return G
+
+@pytest.mark.parametrize("n,seed,variant", GAP_CASES)
+def test_matches_vendored_on_gapped_and_shifted_int_labels(n, seed, variant):
+    G = _gap_variant(erdos_renyi(n, 0.25, seed), variant)
+    with contextlib.redirect_stdout(io.StringIO()):
+        best, _, nodes = greedy_subgraph_solver_vv(G, load_coords(), 6.6, weighted_generate_different_mis).solve(
+            "breadthfirst", exact_solving_threshold=5, subgraph_quantity=4, mis_sample_quantity=2, exploration_threshold=10)
+    r = run_beam(G, vendored_gls_generator(), pasqal_greedy_piece_solver(), 4, 2, code_prune(4, 10))
+    assert r.solution == frozenset(best) and r.pasqal_runs == len(nodes)
+
+@pytest.mark.parametrize("n,seed,variant", GAP_CASES)
+def test_port_reproduces_vendored_runs_on_gapped_labels(n, seed, variant):
+    G = _gap_variant(erdos_renyi(n, 0.25, seed), variant)
+    a = run_code_faithful(G, 4, 2, 10)
+    b = run_beam(G, vendored_gls_generator(), exact_piece_solver, 4, 2, code_prune(4, 10))
+    assert (a.solution, a.quantum_runs, a.atoms) == (b.solution, b.quantum_runs, b.atoms)
+
+HASH_SCRIPT = """
+import networkx as nx
+from learned_selection.engine import run_code_faithful
+from learned_selection.instances import erdos_renyi
+from learned_selection.solvers import top_maximal_sets
+S = nx.relabel_nodes(erdos_renyi(120, 0.25, 0), lambda i: f"T{i:03d}")
+view = S.subgraph([f"T{i:03d}" for i in range(0, 120, 2)])     # < half the nodes: iterates a set of str
+r = run_code_faithful(view, 4, 2, 10)
+print(sorted(r.solution), r.pasqal_runs, r.quantum_runs)
+print([sorted(x) for x in top_maximal_sets(S.subgraph([f"T{i:03d}" for i in range(0, 50, 2)]), 3)])
+"""
+
+def test_string_label_views_reproduce_across_processes():
+    import os, subprocess, sys
+    outs = {subprocess.run([sys.executable, "-W", "ignore", "-c", HASH_SCRIPT], capture_output=True, text=True,
+                           env={**os.environ, "PYTHONHASHSEED": h}, check=True).stdout for h in ("1", "2", "3")}
+    assert len(outs) == 1, outs
+
+def _bad_solver(kind):
+    def solve(piece, m, s):
+        good = exact_piece_solver(piece, m, s)
+        return {"none": [], "empty": [frozenset()], "outside": [good[0] | {"stranger"}],
+                "dependent": [frozenset(list(piece.edges())[0])]}[kind]
+    return solve
+
+@pytest.mark.parametrize("kind", ["none", "empty", "outside", "dependent"])
+def test_engine_rejects_bad_solver_output(kind):
+    with pytest.raises(ValueError):
+        run_code_faithful(erdos_renyi(40, 0.25, 0), 4, 2, 10, solve=_bad_solver(kind))
+
+def test_engine_rejects_empty_generator_output():
+    with pytest.raises(ValueError):
+        run_beam(erdos_renyi(40, 0.25, 0), lambda g, k: [{}], exact_piece_solver, 4, 2, code_prune(4, 10))
+
+
+def test_value_prune_sorts_by_partial_size_plus_value():
+    level = [(nx.empty_graph(n), [0] * s) for n, s in ((5, 3), (1, 1), (9, 2), (0, 4))]
+    calls = []
+    def value(graphs):
+        calls.append(len(graphs))
+        return [len(g) / 2 for g in graphs]            # keys 5.5, 1.5, 6.5, 4.0
+    kept = code_prune(2, 0, value=value)(level, 1)
+    assert [len(g) for g, _ in kept] == [9, 5] and calls == [4]
+
+def test_value_prune_with_zero_value_keeps_the_default_order():
+    level = [(nx.empty_graph(i), [0] * (i % 3)) for i in range(7)]
+    zero = lambda graphs: [0.0] * len(graphs)
+    assert code_prune(3, 2, count_small=True, value=zero)(level, 0) == code_prune(3, 2, count_small=True)(level, 0)
+
+def test_value_is_only_called_when_pruning_fires():
+    calls = []
+    prune = code_prune(2, 10, count_small=True, value=lambda gs: calls.append(len(gs)) or [0.0] * len(gs))
+    level = [(nx.empty_graph(1), [0])] * 4
+    prune(level, 0); prune(level, 0)                   # counter 4, then 8
+    assert calls == []
+    prune(level, 0)                                    # 12 > 10
+    assert calls == [4]
+    prune(level[:2], 0); prune(level[:2], 0); prune(level[:2], 0); prune(level[:2], 0); prune(level[:2], 0); prune(level[:2], 0)
+    assert calls == [4]                                # fired at 12 > 10 again, but 2 branches <= k: nothing to choose
+
+def test_zero_value_reproduces_bounded_runs():
+    zero = lambda graphs: [0.0] * len(graphs)
+    for seed in range(3):
+        G = erdos_renyi(80, 0.15, seed)
+        a, b = run_code_bounded(G, 4, 2, 10), run_code_bounded(G, 4, 2, 10, value=zero)
+        assert (a.solution, a.quantum_runs, a.pasqal_runs, a.atoms) == (b.solution, b.quantum_runs, b.pasqal_runs, b.atoms)
+
+def test_exact_value_prune_changes_some_runs():
+    # with the exact independence number as the value, pruning keeps different branches on some instance
+    exact = lambda graphs: [len(exact_mis(g, 10, 1)[0]) for g in graphs]
+    runs = [(run_code_bounded(G, 4, 2, 10), run_code_bounded(G, 4, 2, 10, value=exact))
+            for G in (erdos_renyi(60, 0.1, s) for s in range(4))]
+    assert any((a.solution, a.quantum_runs) != (b.solution, b.quantum_runs) for a, b in runs)
+
+
+def test_value_hook_returning_too_few_scores_fails_loudly():
+    level = [(nx.empty_graph(2), [0] * i) for i in range(5)]
+    with pytest.raises(ValueError):
+        code_prune(2, 3, value=lambda graphs: [0.0] * (len(graphs) - 1))(level, 5)
+
+
+def test_build_replaces_growth_and_keeps_the_rank():
+    G = erdos_renyi(40, 0.15, 1)
+    seen = []
+    def build(g):
+        seen.append(len(g))
+        return [{v: 32} for v in g]             # one single-vertex piece per vertex: always fits
+    rank = lambda g, maps: [-next(iter(m)) for m in maps]
+    picked = gls_generator(rank=rank, build=build)(G, 2)
+    assert seen == [40] and [set(m) for m in picked] == [{0}, {1}]
+    r = run_code_bounded(G, 2, 2, 5, rank=rank, build=build)
+    assert is_independent(G, r.solution) and r.size > 0

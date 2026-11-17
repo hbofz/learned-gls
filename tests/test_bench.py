@@ -1,0 +1,255 @@
+import json, numpy as np, pytest
+from learned_selection.bench import (BEAM_METHODS, NEW_METHODS, ORACLE_METHODS, gap_pct, grid, known_method,
+                                     parse_method, run_instance, search_of, shard, track_of, main as bench_main)
+from learned_selection.curves import bootstrap_ci, curve_gain, load, paired
+from learned_selection.features import PIECE_FEATURES, VERTEX_FEATURES
+from learned_selection.instances import TEST_SEEDS, TRAIN_SEEDS, VAL_SEEDS
+from learned_selection.models import fit_lgbm, fit_linear, save
+
+KEYS = {"family", "params", "n", "p", "seed", "method", "track", "k", "s", "l", "restarts", "lattice",
+        "piece_solver", "includes_classical_time", "small", "blockade", "max_branches", "time_limit_s", "commit",
+        "size", "best_known", "proven", "gap_pct", "quantum_runs", "pasqal_runs", "atoms", "rounds",
+        "classical_s", "solver_s", "exploded", "max_atoms", "over_30", "atoms_all"}
+
+def test_records_complete_and_consistent():
+    recs = run_instance("er", {"p": 0.25}, 25, 0, ["gls-code", "gls", "gls-screen", "greedy-pasqal", "greedy-mindeg",
+                        "exact"], widths=[(4, 2, 10)], restarts=[1, 2], time_limit_s=10)
+    for r in recs:
+        assert KEYS <= r.keys() and 0 <= r["gap_pct"] <= 100 and r["size"] <= r["best_known"]
+    assert {r["track"] for r in recs if r["method"] == "gls-screen"} == {"hybrid"}
+    assert sorted(r["restarts"] for r in recs if r["method"] == "gls") == [1, 2]
+    assert gap_pct(9, 10) == 10.0 and gap_pct(0, 0) == 0.0
+
+def test_exploded_baseline_is_recorded():
+    recs = run_instance("er", {"p": 0.0}, 40, 0, ["gls-code", "gls"], widths=[(4, 2, 10)], restarts=[1],
+                        time_limit_s=10, max_branches=50)
+    code, bounded = (next(r for r in recs if r["method"] == m) for m in ("gls-code", "gls"))
+    assert code["exploded"] and code["size"] is None and code["gap_pct"] is None
+    assert not bounded["exploded"] and bounded["size"] == 40
+
+def test_bootstrap_and_paired_diff():
+    assert bootstrap_ci([2.0] * 10) == (2.0, 2.0)
+    rows = [dict(family="er", params={"p": 0.25}, n=40, seed=i, method=m, k=4, s=2, l=10, restarts=1, gap_pct=g,
+                 quantum_runs=10, exploded=False) for i in range(5) for m, g in (("gls", 10.0), ("lin-h4", 7.0))]
+    (row,) = paired(rows, "lin-h4", "gls", seeds=range(5))
+    assert row["diff"] == row["lo"] == row["hi"] == -3.0
+
+def test_curve_gain_by_hand():
+    # GLS envelope: (10 runs, 10%) to (100 runs, 5%). At 10**1.5 runs it reads 7.5%, and it reaches 6% at 10**1.8 runs.
+    base = dict(family="er", params={"p": 0.25}, n=40, restarts=1, exploded=False, pasqal_runs=1)
+    pts = [("gls", (1, 1, 1), 10, 10.0), ("gls", (8, 3, 30), 100, 5.0), ("lin-h4", (4, 2, 10), 10 ** 1.5, 6.0)]
+    rows = [dict(base, seed=i, method=m, k=k, s=s, l=l, quantum_runs=r, gap_pct=g)
+            for i in range(5) for m, (k, s, l), r, g in pts]
+    (row,) = curve_gain(rows, "lin-h4")
+    assert row["d_gap"] == pytest.approx(-1.5) and row["run_ratio"] == pytest.approx(10 ** -0.3)
+    assert row["d_gap_lo"] == pytest.approx(row["d_gap_hi"])
+
+def test_load_combines_reference_and_method_files(tmp_path):
+    inst = dict(family="er", params={"p": 0.25}, n=40, seed=0, exploded=False)
+    (tmp_path / "a.jsonl").write_text(json.dumps(dict(inst, method="gls", size=9, proven=None)) + "\n")
+    (tmp_path / "b.jsonl").write_text(json.dumps(dict(inst, method="exact", size=10, proven=True)) + "\n")
+    gls = next(r for r in load([tmp_path / "a.jsonl", tmp_path / "b.jsonl"]) if r["method"] == "gls")
+    assert gls["best_known"] == 10 and gls["gap_pct"] == 10.0 and gls["proven"] is True
+
+def test_parse_method():
+    assert parse_method("lin-h2h4+gin-h5") == [("lin", "h2"), ("lin", "h4"), ("gin", "h5")]
+    assert parse_method("gat-h2h4h5") == [("gat", "h2"), ("gat", "h4"), ("gat", "h5")]
+    for bad in ("lin-h2+gin-h2", "lgb-h5", "foo-h2", "gin-h3", "gin-", "gin-h2h4x", "gin-h4h2", "exact-h2"):
+        with pytest.raises(ValueError):
+            parse_method(bad)
+    assert all(parse_method(m) for m in NEW_METHODS + ORACLE_METHODS)
+
+def test_every_beam_method_runs_with_trained_models(tmp_path):
+    import torch
+    from learned_selection.features import GRAPH_FEATURES
+    from learned_selection.gnn import GNN, save_gnn
+    from learned_selection.models import fit_value_linear
+    rng = np.random.default_rng(0)
+    for hook, d in (("h2", len(VERTEX_FEATURES)), ("h4", len(PIECE_FEATURES))):
+        X, g, y = rng.standard_normal((60, d)), np.repeat(np.arange(6), 10), rng.integers(0, 3, 60)
+        save(fit_linear(X, y, g), tmp_path / f"lin-{hook}.json")
+        save(fit_lgbm(X, y, g, X, y, g, eval_at=2), tmp_path / f"lgb-{hook}.txt")
+    save(fit_value_linear(rng.standard_normal((40, len(GRAPH_FEATURES))), rng.integers(0, 9, 40)), tmp_path / "lin-h5.json")
+    d, p = len(VERTEX_FEATURES), len(PIECE_FEATURES)
+    torch.manual_seed(0)
+    for conv in ("gin", "sage", "gat"):
+        for hook, head in (("h2", "vertex"), ("h4", "piece"), ("h5", "value")):
+            save_gnn(GNN(conv, head, np.zeros(d), np.ones(d), np.zeros(p), np.ones(p)), tmp_path / f"{conv}-{hook}.pt")
+    (tmp_path / "cma-h2.json").write_text(json.dumps({"theta": [6.0, 0.5, 0.0]}))
+    recs = run_instance("er", {"p": 0.25}, 25, 0, BEAM_METHODS, widths=[(2, 2, 5)], restarts=[1],
+                        time_limit_s=10, models_dir=tmp_path)
+    assert {r["method"] for r in recs} == set(BEAM_METHODS) and all(r["size"] for r in recs)
+    assert {r["track"] for r in recs if r["method"] in NEW_METHODS} == {"structure"}
+    assert {r["track"] for r in recs if r["method"] in ORACLE_METHODS} == {"oracle"}
+
+def test_resume_skips_a_cut_off_last_line(tmp_path, capsys):
+    out = tmp_path / "run.jsonl"
+    args = ["--family", "er", "--params", "p=0.25", "--n", "20", "--methods", "greedy-mindeg", "--out", str(out)]
+    bench_main(["--seeds", "0-0", *args])
+    out.write_text(out.read_text() + '{"family": "er", "par')       # a run killed mid-write
+    bench_main(["--seeds", "0-1", *args])
+    captured = capsys.readouterr()
+    assert f"skipping line 2 of {out}: not valid JSON" in captured.err
+    assert "1 instances to run, 1 already done" in captured.out
+    lines = out.read_text().splitlines()
+    assert len(lines) == 3 and [json.loads(lines[i])["seed"] for i in (0, 2)] == [0, 1]
+
+def test_shard_splits_instances_disjointly():
+    xs = list(range(10))
+    assert shard(xs, "0/3") == [0, 3, 6, 9]
+    shards = [shard(xs, f"{i}/3") for i in range(3)]
+    assert sorted(x for part in shards for x in part) == xs
+    assert shard(xs, None) == xs
+    with pytest.raises(ValueError):
+        shard(xs, "3/3")
+
+
+def test_a_gnn_file_with_the_wrong_head_is_refused(tmp_path):
+    from learned_selection.bench import method_runner
+    from learned_selection.gnn import GNN, save_gnn
+    d, p = len(VERTEX_FEATURES), len(PIECE_FEATURES)
+    save_gnn(GNN("gin", "vertex", np.zeros(d), np.ones(d), np.zeros(p), np.ones(p)), tmp_path / "gin-h4.pt")
+    with pytest.raises(ValueError, match=r"gin-h4\.pt.*'vertex'.*'piece'"):
+        method_runner("gin-h4", tmp_path)
+
+
+def test_sel_grid_is_training_settings_on_unused_seeds():
+    g = grid("sel")
+    assert len(g) == 8 * 2 * 20 and {s for *_, s in g} == set(range(105, 125))
+    assert not {s for *_, s in g} & (set(TEST_SEEDS) | set(TRAIN_SEEDS) | set(VAL_SEEDS))
+
+
+def test_parse_method_with_new_kinds_and_search():
+    assert parse_method("dlin-h2h4+dsage-h5") == [("dlin", "h2"), ("dlin", "h4"), ("dsage", "h5")]
+    assert parse_method("lin-h2+gin-h4+sage-h5+mcts") == [("lin", "h2"), ("gin", "h4"), ("sage", "h5")]
+    assert search_of("lin-h2+gin-h4+sage-h5+mcts") == 1.0
+    assert search_of("lin-h2+gin-h4+sage-h5+mcts-c0.5") == 0.5
+    assert search_of("lin-h2h4+sage-h5") is None
+    with pytest.raises(ValueError):
+        parse_method("lin-h2+gin-h4+mcts")     # no value model
+    with pytest.raises(ValueError):
+        parse_method("mcts")
+
+
+def test_known_method_and_track():
+    assert known_method("dgin-h2h4h5") and known_method("gls") and known_method("exact")
+    assert not known_method("foo-h2")
+    assert track_of("gls-screen") == "hybrid" and track_of("exact-h5") == "oracle"
+    assert track_of("dgin-h2h4h5") == "structure"
+    assert track_of("lin-h2+gin-h4+sage-h5+mcts") == "structure" and track_of("greedy-mindeg") == "classical"
+    assert track_of("exact") == "classical"
+
+
+def test_an_unknown_name_has_no_runner():
+    from learned_selection.bench import method_runner
+    with pytest.raises(ValueError):
+        method_runner("foo-h2", None)
+
+
+def test_parse_method_with_builder_and_tilt():
+    from learned_selection.bench import tilt_of
+    assert parse_method("bld-h3+dgin-h4+dgin-h5") == [("bld", "h3"), ("dgin", "h4"), ("dgin", "h5")]
+    assert parse_method("dgin-h2h4h5+tilt-0.1") == [("dgin", "h2"), ("dgin", "h4"), ("dgin", "h5")]
+    assert parse_method("bld-h3+sage-h4+dsage-h5+mcts-c0.5")[0] == ("bld", "h3")
+    assert tilt_of("dgin-h2h4h5+tilt-0.1") == 0.1 and tilt_of("dgin-h2h4h5") is None
+    assert known_method("dgin-h2+pg-h4+dgin-h5") and known_method("bld-h3+bgin-h4+bgin-h5")
+    for bad in ("gin-h3", "bld-h2", "bld-h3+gin-h2+gin-h4", "lin-h2+tilt-0.1", "dgin-h2h4h5+tilt-0.1+mcts",
+                "dgin-h2h4h5+mcts+tilt-0.1", "bld-h3+gin-h4+mcts", "tilt-0.1"):
+        with pytest.raises(ValueError):
+            parse_method(bad)
+
+
+def test_tilt_adds_beta_times_size_to_the_rank(tmp_path):
+    import networkx as nx
+    from learned_selection.bench import method_hooks
+    rng = np.random.default_rng(0)
+    for hook, d in (("h2", len(VERTEX_FEATURES)), ("h4", len(PIECE_FEATURES))):
+        X, g, y = rng.standard_normal((60, d)), np.repeat(np.arange(6), 10), rng.integers(0, 3, 60)
+        save(fit_linear(X, y, g), tmp_path / f"lin-{hook}.json")
+    G = nx.path_graph(6)
+    maps = [{0: 0}, {1: 0, 2: 1, 3: 2}]
+    plain = method_hooks("lin-h2h4", tmp_path)["rank"](G, maps)
+    tilted = method_hooks("lin-h2h4+tilt-0.5", tmp_path)["rank"](G, maps)
+    assert np.allclose(np.asarray(tilted) - np.asarray(plain), [0.5, 1.5], atol=1e-9)
+
+
+def test_new_grids_use_their_own_seeds():
+    from learned_selection.instances import FRESH_SEEDS, SEL_SEEDS
+    assert {i[3] for i in grid("fresh")} == set(FRESH_SEEDS) and len(grid("fresh")) == len(grid("test"))
+    cells = lambda name: {(f, json.dumps(p), n) for f, p, n, _ in grid(name)}
+    assert cells("fresh") == cells("test")
+    assert {i[3] for i in grid("train")} == set(TRAIN_SEEDS) and len(grid("train")) == 480
+    assert not set(FRESH_SEEDS) & (set(TEST_SEEDS) | set(SEL_SEEDS) | set(TRAIN_SEEDS) | set(VAL_SEEDS))
+    assert FRESH_SEEDS == range(1020, 1040)
+
+
+def test_bandit_names_are_known_and_track_structure():
+    assert known_method("bandit-i") and known_method("bandit-r")
+    assert track_of("bandit-i") == "structure" and track_of("bandit-r") == "structure"
+    with pytest.raises(ValueError):
+        parse_method("bandit-i")
+
+
+def test_a_bandit_name_routes_to_its_runner(tmp_path, monkeypatch):
+    from learned_selection import bandit
+    from learned_selection.bench import method_runner
+    monkeypatch.setattr(bandit, "instance_runner", lambda d, solve: ("instance", d))
+    assert method_runner("bandit-i", tmp_path) == ("instance", tmp_path)
+    monkeypatch.setattr(bandit, "round_runner", lambda d, solve: ("round", d))
+    assert method_runner("bandit-r", tmp_path) == ("round", tmp_path)
+
+
+RUNNERS = [("gls", 5), ("lin-h2h4+sage-h5", 5), ("bld-h3+dgin-h4+dgin-h5", 5), ("bld-h3+sage-h4+dsage-h5+mcts-c0.5", 25),
+           ("bandit-r", 10), ("bandit-r", 9002)]
+
+
+def _spy(log, cut=None):
+    from learned_selection.engine import exact_piece_solver
+
+    def solve(piece, mapping, s):
+        log.append((piece, mapping, s))
+        out = exact_piece_solver(piece, mapping, s)
+        return out if cut is None else out[:cut]
+    return solve
+
+
+@pytest.mark.parametrize("name,l", RUNNERS)
+def test_every_runner_sends_pieces_to_solve(name, l):
+    from learned_selection.bench import method_runner
+    from learned_selection.instances import make
+    G, log = make("er", 40, 0, p=0.25), []
+    want = method_runner(name, "models")(G, 2, 2, l, 0)
+    got = method_runner(name, "models", solve=_spy(log))(G, 2, 2, l, 0)
+    assert len(log) == got.pasqal_runs > 0
+    assert all(len(p) > 5 and set(m) == set(p) and len(set(m.values())) == len(m) for p, m, _ in log)
+    assert [getattr(got, f) for f in ("size", "quantum_runs", "pasqal_runs", "atoms")] == \
+           [getattr(want, f) for f in ("size", "quantum_runs", "pasqal_runs", "atoms")]
+
+
+def test_round_bandit_passes_the_arms_s():
+    from learned_selection.bench import method_runner
+    from learned_selection.instances import make
+    G = make("er", 40, 0, p=0.25)
+    for l, s in ((9001, 1), (9004, 3)):
+        log = []
+        method_runner("bandit-r", "models", solve=_spy(log))(G, 2, 2, l, 0)
+        assert log and {x[2] for x in log} == {s}
+
+
+@pytest.mark.parametrize("name,l", RUNNERS)
+def test_runners_take_short_answers(name, l):
+    from learned_selection.bench import method_runner
+    from learned_selection.instances import make
+    from learned_selection.solvers import is_independent
+    G = make("er", 40, 0, p=0.25)
+    res = method_runner(name, "models", solve=_spy([], cut=1))(G, 2, 2, l, 0)
+    assert is_independent(G, res.solution) and res.size > 0
+
+
+def test_run_instance_labels_the_solver():
+    args = ("er", {"p": 0.25}, 25, 0, ["gls"])
+    kw = dict(widths=[(2, 2, 5)], restarts=[1], time_limit_s=5)
+    assert {r["piece_solver"] for r in run_instance(*args, **kw)} == {"exact-top-s"}
+    log = []
+    rows = run_instance(*args, **kw, solve=_spy(log), piece_solver="emu")
+    assert log and {r["piece_solver"] for r in rows} == {"emu"}
